@@ -1,0 +1,977 @@
+---
+title: "Mechanistic Insights and Clinical Relevance of Gene–Smoking Interactions on Blood Biochemical Biomarkers"
+author: "wy"
+date: "2-2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: paper
+    highlight: tango
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  eval    = FALSE
+)
+```
+
+------------------------------------------------------------------------
+
+# Step 1: Smoking Data Quality Control
+
+## Classification Pipeline
+
+The smoking status classification pipeline is based on the following UK
+Biobank data fields:
+
+-   **Field 1239**: Current smoking status
+-   **Field 1249**: Past smoking history
+-   **Fields 2867 / 2897**: Duration of smoking
+-   **Field 2644**: Light smoker assessment
+-   **Fields 2887 / 3456**: Smoking frequency
+
+```         
+Step 1.1: Current Smoking Status (Field 1239)
+  ├── Most          →  39,231 individuals  → Step 1.5
+  ├── Occasionally  →  13,731 individuals  → Step 1.2
+  └── No            → 448,133 individuals  → Step 1.2
+
+Step 1.2: Past Smoking History (Field 1249)
+  ├── Most          → 120,907 individuals  → Step 1.3
+  ├── Occasionally  →  65,386 individuals  → Step 1.4
+  ├── Once/twice    →  73,012 individuals  → Step 1.4
+  └── Never         → 200,847 individuals  → Classified as Never Smokers
+
+Step 1.3: Duration Assessment (Fields 2867, 2897)
+  ├── > 1 year      → 120,474 individuals  → Step 1.5
+  └── < 1 year      →     433 individuals  → Excluded
+
+Step 1.4: Light Smoker Assessment (Field 2644)
+  ├── >= 100 times  →  60,401 individuals  → Excluded
+  └── < 100 times   →  71,219 individuals  → Classified as Never Smokers
+
+Step 1.5: Frequency Assessment (Fields 2887, 3456)
+  └── Excluding < 1 cigarette/day: 528 individuals
+      Final Ever Smokers: 159,177 individuals
+
+Final Classification:
+  Ever Smokers  = 159,177
+  Never Smokers = 272,066
+  Total         = 431,243
+```
+
+------------------------------------------------------------------------
+
+# Step 2: Biomarkers Preprocessing
+
+Quality control pipeline based on:
+
+1.  Sinnott-Armstrong et al. (2021) *Nature Genetics* 53:185–194
+2.  Westerman et al. (2022) *Nature Communications* 13:21
+
+## 2.1 Sample Exclusion Criteria
+
+```{r sample-exclusion}
+library(data.table)
+library(dplyr)
+
+# ------ Exclude samples with withdrawn consent ------
+withdraw_ids <- fread("path/to/withdraw_list.txt")$V1
+
+# ------ Exclude pregnant individuals (Field 3140) ------
+pregnant <- fread("path/to/phenotype.csv") %>%
+  filter(f.3140.0.0 == 1) %>%
+  pull(f.eid)
+
+# ------ Exclude individuals diagnosed with cancer within 1 year of baseline ------
+# Fields: f.53.0.0 (date of attending assessment centre),
+#         f.40005.*.* (date of cancer diagnosis)
+baseline_date <- fread("path/to/baseline_date.csv")
+cancer_dates  <- fread("path/to/cancer_dates.csv")
+
+cancer_in_1year <- cancer_dates %>%
+  left_join(baseline_date, by = "f.eid") %>%
+  mutate(
+    across(starts_with("f.40005"), as.Date),
+    baseline_date = as.Date(f.53.0.0)
+  ) %>%
+  filter(if_any(
+    starts_with("f.40005"),
+    ~ abs(difftime(., baseline_date, units = "days")) <= 365
+  )) %>%
+  pull(f.eid)
+
+# ------ Combine all exclusion criteria ------
+excluded_ids <- unique(c(withdraw_ids, pregnant, cancer_in_1year))
+```
+
+## 2.2 Statin Medication Adjustment
+
+Biomarkers affected by statin use are adjusted using correction factors
+from Tobin et al. (2005, *Am J Epidemiol*):
+
+| Biomarker        | UKB Field | Correction Factor |
+|------------------|-----------|-------------------|
+| Cholesterol      | 30690     |   0.749           |
+| LDL direct       | 30780     |   0.684           |
+| Apolipoprotein B | 30640     |   0.719           |
+
+```{r statin-adjustment}
+# ------ Identify individuals on statin therapy ------
+# Field 20003: Treatment/medication code (UKB Coding 4)
+drugs_data   <- fread("path/to/medication.csv")
+statin_codes <- c(1140861958, 1140888594, 1141146234)
+
+on_statins <- drugs_data %>%
+  filter(if_any(starts_with("f.20003"), ~ . %in% statin_codes)) %>%
+  pull(f.eid)
+
+# ------ Adjust statin-affected biomarkers ------
+biomarker_data <- fread("path/to/biomarkers.csv") %>%
+  filter(!f.eid %in% excluded_ids) %>%
+  mutate(
+    chol_adj = ifelse(f.eid %in% on_statins, f.30690.0.0 / 0.749, f.30690.0.0),
+    ldl_adj  = ifelse(f.eid %in% on_statins, f.30780.0.0 / 0.684, f.30780.0.0),
+    apoB_adj = ifelse(f.eid %in% on_statins, f.30640.0.0 / 0.719, f.30640.0.0)
+  )
+```
+
+## 2.3 Outlier Detection and Removal
+
+Outliers are removed using the **4×IQR rule**, stratified by ethnic
+group:
+
+```{r outlier-removal}
+# ------ Function: replace outliers based on 4×IQR rule ------
+replace_outliers_iqr <- function(x) {
+  Q1        <- quantile(x, 0.25, na.rm = TRUE)
+  Q3        <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_value <- Q3 - Q1
+  lower     <- Q1 - 4 * IQR_value
+  upper     <- Q3 + 4 * IQR_value
+  x[x < lower | x > upper] <- NA
+  return(x)
+}
+
+# ------ Stratified outlier removal by ethnic group (Field 21000) ------
+ethnic_data <- fread("path/to/ethnic.csv")
+
+biomarker_cleaned <- biomarker_data %>%
+  left_join(ethnic_data, by = "f.eid") %>%
+  group_by(ethnic_group) %>%
+  mutate(across(where(is.numeric) & !f.eid, replace_outliers_iqr)) %>%
+  ungroup() %>%
+  filter(if_any(where(is.numeric) & !f.eid, ~ !is.na(.)))
+
+# ------ Save cleaned biomarker data ------
+fwrite(biomarker_cleaned, "path/to/biomarker_qc.csv")
+```
+
+------------------------------------------------------------------------
+
+# Step 3: Genotype Quality Control
+
+Tool: **PLINK2** (<https://www.cog-genomics.org/plink/2.0/>)
+
+## 3.1 Sample-Level QC (R)
+
+```{r sample-qc}
+library(ukbtools)
+library(data.table)
+
+# ------ Load kinship data (Field 22021) ------
+kinship_data <- fread("path/to/ukb_rel.dat")
+sample_ids   <- fread("path/to/sample_ids.txt")
+
+# ------ Apply sample-level QC filters ------
+# Field 22019: Sex chromosome aneuploidy
+# Field 22027: Outliers for heterozygosity or missing rate
+# Field 22001: Genetic sex
+# Field 31:    Self-reported sex
+qc_data <- fread("path/to/ukb_qc.txt") %>%
+  filter(
+    sex_chr_aneuploidy == 0,       # Exclude sex chromosome aneuploidies
+    het_missing_outlier == 0,      # Exclude heterozygosity/missingness outliers
+    !is.na(genetic_sex),           # Require inferred genetic sex
+    genetic_sex == reported_sex    # Exclude sex mismatches
+  )
+
+pass_qc_ids <- qc_data$IID
+
+# ------ Relatedness filter (kinship coefficient cutoff = 0.0884, ~3rd-degree relatives) ------
+subj_remove <- ukb_gen_samples_to_remove(
+  ukbdata       = kinship_data,
+  ukb.with.data = pass_qc_ids,
+  cutoff        = 0.0884
+)
+
+final_keep_ids <- setdiff(pass_qc_ids, subj_remove)
+
+fwrite(
+  data.table(FID = final_keep_ids, IID = final_keep_ids),
+  "samples_keep.txt",
+  sep       = "\t",
+  col.names = FALSE
+)
+```
+
+## 3.2 Variant-Level QC (PLINK2 Bash)
+
+Filtering criteria:
+
+-   Imputation information score \> 0.5
+-   Minor allele frequency (MAF) ≥ 0.01
+-   Hardy–Weinberg equilibrium test P ≥ 1×10⁻⁶
+
+```{bash variant-qc, engine="bash"}
+#!/bin/bash
+
+# ------ Extract variants with imputation INFO score > 0.5 ------
+awk '$8 > 0.5 {print $2}' ukb_mfi_chr*.txt > info0.5_snps.txt
+
+for chr in {1..22}; do
+  echo "Processing chromosome ${chr}"
+
+  plink2 \
+    --bgen    ukb_imp_chr${chr}_v3.bgen ref-first \
+    --sample  ukb_imp_chr${chr}_v3.sample \
+    --keep    samples_keep.txt \
+    --extract info0.5_snps.txt \
+    --maf     0.01 \
+    --hwe     1e-6 \
+    --rm-dup  force-first \
+    --make-bed \
+    --out     chr${chr} \
+    --threads 10
+
+  if [ $? -eq 0 ]; then
+    echo "Chromosome ${chr} completed successfully"
+  else
+    echo "Error: chromosome ${chr} failed"
+    exit 1
+  fi
+done
+
+echo "Genotype QC completed"
+```
+
+------------------------------------------------------------------------
+
+# Step 4: Gene-Smoking Interaction Analysis
+
+## 4.1 Gaussian Transformation (MATLAB)
+
+> Note: The following code must be executed in a MATLAB environment.
+
+``` matlab
+function outdata = bqw_gaussian_resample(data, outpath, opt)
+% Gaussian transformation for biomarker data
+%
+% Input:
+%   data             : [nSample x nFeature] matrix of raw biomarker values
+%   outpath          : output file path for saving results
+%   opt.repeat_vals  : 'yes' or 'no' — controls handling of tied values
+%
+% Output:
+%   outdata          : structure containing Gaussian-transformed data
+
+if nargin < 2
+    outdir  = pwd;
+    outpath = [outdir, filesep, 'gauss_data.mat'];
+end
+
+if nargin < 3
+    opt = struct;
+end
+
+if ~isfield(opt, 'repeat_vals')
+    opt.repeat_vals = 'yes';
+end
+
+msize = size(data);
+rng(1234);                      % Set random seed for reproducibility
+GS    = randn(msize(1), 1);
+zGS   = sort(zscore(GS));
+resamp_data = [];
+
+for f = 1:msize(2)
+    fdata = data(:, f);
+
+    if strcmp(opt.repeat_vals, 'no')
+        % No special handling for tied values
+        [~, ind]       = sort(fdata);
+        GS_fdata(ind)  = zGS;
+        resamp_data(:, f) = GS_fdata';
+    else
+        % Handle tied values: assign the same Gaussian rank to identical values
+        uniqVal = unique(fdata);
+        nU      = length(uniqVal);
+        zGS1    = sort(zscore(GS(1:nU, 1)));
+        GS_fdata = [];
+
+        for n = 1:nU
+            id = find(fdata == uniqVal(n));
+            GS_fdata(id, 1) = zGS1(n);
+        end
+
+        GS_fdata          = zscore(GS_fdata);
+        resamp_data(:, f) = GS_fdata;
+    end
+    clear GS_fdata ind
+end
+
+outdata.resamp_data = resamp_data;
+outdata.gauss_ref   = GS;
+save(outpath, '-struct', 'outdata')
+end
+```
+
+## 4.2 Covariate Adjustment and Residual Calculation
+
+Covariates include: sex, age, age×sex interaction, age², age²×sex, the
+first 40 principal components, blood sample dilution factor, assessment
+centre, blood draw time, recruitment date, processing delay time,
+Townsend deprivation index, BMI, and alcohol consumption status.
+
+```{r residuals}
+library(data.table)
+library(dplyr)
+
+# ------ Generic function to compute residuals after covariate adjustment ------
+calculate_residuals <- function(data, pheno_col, covar_cols) {
+  formula <- as.formula(
+    paste(pheno_col, "~", paste(covar_cols, collapse = " + "))
+  )
+  model <- lm(formula, data = data)
+  return(resid(model))
+}
+
+# ------ Example: Total Bilirubin (TBIL) ------
+# Input file contains: FID, IID, tbil_gauss, and all covariate columns
+df <- fread("gauss_tbil_data.txt")
+
+covariates <- c(
+  "sex", "age", "agesex", "age2", "age2sex",   # Demographic terms
+  paste0("PC", 1:40),                            # Genetic principal components
+  "dilution", "center", "draw_time",             # Blood sample processing variables
+  "recruit_date", "process_delay",               # Sample logistics variables
+  "tdi", "bmi", "alcohol"                        # Lifestyle covariates
+)
+
+df$tbil_resid <- calculate_residuals(df, "tbil_gauss", covariates)
+
+# Save residuals for downstream analysis
+fwrite(df[, .(FID, IID, tbil_resid)], "phenotype_tbil_residuals.txt", sep = "\t")
+
+# Repeat the above procedure for all other biomarkers:
+# CRP, HbA1c, ALT, GGT, Urate, Direct Bilirubin (DBIL), etc.
+```
+
+## 4.3 Genome-Wide GxE Analysis (PLINK2 Bash)
+
+```{bash gxe-analysis, engine="bash"}
+#!/bin/bash
+
+phenoname=$1          # Phenotype name, e.g., "tbil"
+envname=$2            # Environmental variable name, e.g., "ever_smoke"
+covfile=$3            # Covariate file path
+genefile_prefix=$4    # Genotype file prefix, e.g., "chr"
+phenofile=$5          # Phenotype file path
+biomarker=$6          # Biomarker column name, e.g., "tbil_resid"
+OutPath=$7            # Output directory
+keep_file=$8          # Sample keep file path
+
+mkdir -p "$OutPath"
+
+for chr in {1..22}; do
+  echo "Processing chromosome ${chr} — biomarker: ${biomarker}"
+
+  plink2 \
+    --bfile       "${genefile_prefix}${chr}" \
+    --keep        "$keep_file" \
+    --pheno       "$phenofile" \
+    --pheno-name  "$biomarker" \
+    --covar       "$covfile" \
+    --covar-name  "$envname" \
+    --glm interaction \
+    --parameters  1-3 \
+    --variance-standardize \
+    --vif         100000 \
+    --threads     10 \
+    --out         "$OutPath/Interaction_${envname}_${biomarker}_chr${chr}"
+
+  # Extract interaction term results (every 3rd row corresponds to the GxE term)
+  sed -n '1~3p' \
+    "$OutPath/Interaction_${envname}_${biomarker}_chr${chr}.${biomarker}.glm.linear" \
+    >> "$OutPath/Results_inter_${biomarker}.${envname}_all"
+
+  # Remove intermediate per-chromosome result files to save disk space
+  rm -f "$OutPath/Interaction_${envname}_${biomarker}_chr${chr}.${biomarker}.glm.linear"
+done
+
+# ------ Extract genome-wide significant results (P < 5e-8) ------
+awk 'BEGIN{FS=" "}{if ($15 < 0.00000005) print}' \
+  "$OutPath/Results_inter_${biomarker}.${envname}_all" \
+  > "$OutPath/Results_inter_${biomarker}.${envname}_thre5e-8"
+
+# ------ Apply multiple testing correction if significant hits are found ------
+if [ -s "$OutPath/Results_inter_${biomarker}.${envname}_thre5e-8" ]; then
+  cat "$OutPath/Interaction_${envname}_${biomarker}_chr"*.glm.linear \
+    > "$OutPath/temp_all_results.txt"
+
+  plink2 \
+    --adjust-file "$OutPath/temp_all_results.txt" \
+    --test        "ADDx${envname}" \
+    --out         "$OutPath/Results_inter_${biomarker}.${envname}_adjusted"
+
+  rm -f "$OutPath/temp_all_results.txt"
+fi
+
+echo "Genome-wide GxE analysis completed — biomarker: ${biomarker}"
+```
+
+## 4.4 Clumping Analysis (LD Pruning)
+
+```{bash clumping, engine="bash"}
+#!/bin/bash
+
+input_file=$1         # Input GWAS result file
+output_prefix=$2      # Output file prefix
+genefile_prefix=$3    # Genotype file prefix
+
+for chr in {1..22}; do
+  echo "Clumping chromosome ${chr}"
+
+  plink \
+    --bfile           "${genefile_prefix}${chr}" \
+    --clump           "${input_file}_chr${chr}" \
+    --clump-p1        1.78e-09 \
+    --clump-r2        0.1 \
+    --clump-kb        1000 \
+    --clump-snp-field ID \
+    --clump-field     P \
+    --out             "${output_prefix}_chr${chr}" \
+    --threads         10
+done
+
+echo "Clumping completed"
+```
+
+------------------------------------------------------------------------
+
+# Step 5: Validation and Sensitivity Analyses
+
+## 5.1 Meta-Analysis (METAL)
+
+```{bash metal-config, engine="bash"}
+# Generate the METAL configuration file
+cat > meta_analysis.txt << 'EOF'
+SCHEME    STDERR
+SEPARATOR TAB
+
+MARKER  ID
+WEIGHT  OBS_CT
+ALLELE  ALT REF
+FREQ    A1_FREQ
+EFFECT  BETA
+STDERR  SE
+PVAL    P
+
+PROCESS study1.txt
+PROCESS study2.txt
+PROCESS study3.txt
+PROCESS study4.txt
+
+ANALYZE
+EOF
+
+# Run METAL
+metal meta_analysis.txt
+```
+
+## 5.2 Smoking Dosage Analysis (Pack-Years, Field 20161)
+
+Run GxE analysis for all 14 LD-independent interaction loci using
+pack-years as the continuous smoking exposure:
+
+```{bash pack-years, engine="bash"}
+#!/bin/bash
+
+run_gxe_dosage() {
+  local snp=$1
+  local chr=$2
+  local pheno=$3
+
+  plink2 \
+    --bfile       genotype_chr${chr} \
+    --snp         "$snp" \
+    --pheno       "${pheno}.txt" \
+    --pheno-name  "$pheno" \
+    --covar       "${pheno}.txt" \
+    --covar-name  pack_years \
+    --glm interaction \
+    --parameters  1-3 \
+    --variance-standardize \
+    --vif         100000 \
+    --threads     10 \
+    --out         "${snp}_${pheno}_packyears"
+}
+
+# ------ 14 LD-independent interaction loci ------
+run_gxe_dosage rs57274629        1  Resf.30710.0.0   # CRP
+run_gxe_dosage rs7170068        15  Resf.30710.0.0   # CRP
+run_gxe_dosage rs4148324         2  Resf.30660.0.0   # TBIL
+run_gxe_dosage rs3747207        22  Resf.30620.0.0   # HbA1c
+run_gxe_dosage rs11675168        2  Resf.30660.0.0   # TBIL
+run_gxe_dosage rs5760495        22  Resf.30730.0.0   # DBIL
+run_gxe_dosage rs146009840      15  Resf.30750.0.0   # ALT
+run_gxe_dosage rs887829          2  Resf.30840.0.0   # CRP
+run_gxe_dosage rs143373661       2  Resf.30840.0.0   # CRP
+run_gxe_dosage rs141119227       2  Resf.30840.0.0   # CRP
+run_gxe_dosage rs10199512        2  Resf.30840.0.0   # CRP
+run_gxe_dosage 2:234594895_AT_A  2  Resf.30840.0.0   # CRP
+run_gxe_dosage 4:9960841_TA_T    4  Resf.30880.0.0   # Urate
+
+echo "Pack-years analysis completed"
+```
+
+## 5.3 Follow-Up Biomarker Analysis (Repeat Measurement, 2012–2013)
+
+```{bash followup, engine="bash"}
+#!/bin/bash
+
+run_gxe_followup() {
+  local snp=$1
+  local chr=$2
+  local pheno=$3
+
+  plink2 \
+    --bfile       genotype_chr${chr} \
+    --snp         "$snp" \
+    --pheno       "${pheno}_followup.txt" \
+    --pheno-name  "$pheno" \
+    --covar       "${pheno}_followup.txt" \
+    --covar-name  smoking_status \
+    --glm interaction \
+    --parameters  1-3 \
+    --variance-standardize \
+    --vif         100000 \
+    --threads     10 \
+    --out         "${snp}_${pheno}_followup"
+}
+
+# ------ Instance 1 follow-up data — 14 LD-independent loci ------
+run_gxe_followup rs57274629        1  Resf.30710.1.0
+run_gxe_followup rs7170068        15  Resf.30710.1.0
+run_gxe_followup rs4148324         2  Resf.30660.1.0
+run_gxe_followup rs3747207        22  Resf.30620.1.0
+run_gxe_followup rs11675168        2  Resf.30660.1.0
+run_gxe_followup rs5760495        22  Resf.30730.1.0
+run_gxe_followup rs146009840      15  Resf.30750.1.0
+run_gxe_followup rs887829          2  Resf.30840.1.0
+run_gxe_followup rs143373661       2  Resf.30840.1.0
+run_gxe_followup rs141119227       2  Resf.30840.1.0
+run_gxe_followup rs10199512        2  Resf.30840.1.0
+run_gxe_followup 2:234594895_AT_A  2  Resf.30840.1.0
+run_gxe_followup 4:9960841_TA_T    4  Resf.30880.1.0
+
+echo "Follow-up biomarker analysis completed"
+```
+
+------------------------------------------------------------------------
+
+# Step 6: Colocalization and SMR & HEIDI Analyses
+
+## 6.1 Colocalization Analysis (coloc)
+
+```{r coloc}
+library(coloc)
+library(data.table)
+
+run_coloc_stratified <- function(harmonised_data,
+                                  xqtl_type,
+                                  smoking_status,
+                                  min_snps = 80) {
+
+  # Determine the grouping column based on xQTL type
+  group_col   <- ifelse(xqtl_type == "mqtl", "cpg", "gene")
+  targets     <- unique(harmonised_data[[group_col]])
+  all_summary <- list()
+
+  for (target in targets) {
+    dt <- harmonised_data[get(group_col) == target]
+    dt <- unique(dt, by = "SNP")
+
+    # Skip targets with insufficient SNPs for reliable colocalization
+    if (nrow(dt) < min_snps) next
+
+    # ------ Dataset 1: xQTL (exposure) ------
+    dataset1 <- list(
+      snp     = dt$SNP,
+      beta    = dt$beta.exposure,
+      varbeta = dt$se.exposure^2,
+      type    = "quant",
+      MAF     = dt$eaf.exposure,
+      N       = dt$samplesize.exposure[1]
+    )
+
+    # ------ Dataset 2: GWAS (outcome), stratified by smoking status ------
+    dataset2 <- list(
+      snp     = dt$SNP,
+      beta    = dt$beta.outcome,
+      varbeta = dt$se.outcome^2,
+      type    = "quant",
+      MAF     = dt$eaf.outcome,
+      N       = dt$samplesize.outcome[1]
+    )
+
+    # Run Bayesian colocalization test
+    res        <- coloc.abf(dataset1, dataset2)
+    summary_dt <- as.data.table(t(res$summary))
+    summary_dt[, `:=`(
+      target         = target,
+      xqtl_type      = xqtl_type,
+      smoking_status = smoking_status,
+      n_snps         = nrow(dt)
+    )]
+
+    all_summary[[target]] <- summary_dt
+  }
+
+  # Return results sorted by posterior probability of colocalization (H4)
+  return(rbindlist(all_summary)[order(-PP.H4.abf)])
+}
+
+# ------ Run colocalization for mQTL and eQTL, stratified by smoking status ------
+mqtl_never  <- run_coloc_stratified(harmonised_mqtl_never,  "mqtl", "never_smoker")
+mqtl_smoker <- run_coloc_stratified(harmonised_mqtl_smoker, "mqtl", "smoker")
+eqtl_never  <- run_coloc_stratified(harmonised_eqtl_never,  "eqtl", "never_smoker")
+eqtl_smoker <- run_coloc_stratified(harmonised_eqtl_smoker, "eqtl", "smoker")
+
+# ------ Combine and save all colocalization results ------
+results_all <- rbind(mqtl_never, mqtl_smoker, eqtl_never, eqtl_smoker)
+fwrite(results_all, "coloc_results.txt", sep = "\t")
+```
+
+## 6.2 SMR & HEIDI Analysis
+
+```{bash smr-heidi, engine="bash"}
+#!/bin/bash
+
+SMR="/path/to/smr-1.3.1"
+BFILE="/path/to/LD_reference/EUR"
+RES_DIR="/path/to/results"
+
+# Define chromosome–biomarker pairs to be analysed
+declare -a PAIRS=(
+  "chr1_30710"    # CRP
+  "chr15_30710"   # CRP
+  "chr15_30750"   # ALT
+  "chr22_30620"   # HbA1c
+  "chr22_30730"   # DBIL
+  "chr2_30660"    # TBIL
+  "chr2_30840"    # CRP
+  "chr4_30880"    # Urate
+)
+
+for CHR_PHENO in "${PAIRS[@]}"; do
+  CHR=$(echo ${CHR_PHENO} | cut -d'_' -f1 | sed 's/chr//')
+  PHENO=$(echo ${CHR_PHENO} | cut -d'_' -f2)
+  echo "Processing ${CHR_PHENO}"
+
+  # ------ eQTL analysis — never smokers and ever smokers ------
+  for SMOKE_STATUS in never ever; do
+    ${SMR} \
+      --bfile         ${BFILE} \
+      --gwas-summary  /path/to/gwas_${SMOKE_STATUS}/gwas_Resf.${PHENO}.0.0_chr${CHR}.ma \
+      --beqtl-summary /path/to/eqtl/Whole_Blood \
+      --out           ${RES_DIR}/${CHR_PHENO}_${SMOKE_STATUS}_eqtl \
+      --thread-num    12 \
+      --peqtl-smr     5e-8 \
+      --heidi-min-m   10
+  done
+
+  # ------ mQTL analysis — never smokers and ever smokers ------
+  for SMOKE_STATUS in never ever; do
+    ${SMR} \
+      --bfile         ${BFILE} \
+      --gwas-summary  /path/to/gwas_${SMOKE_STATUS}/gwas_Resf.${PHENO}.0.0_chr${CHR}.ma \
+      --beqtl-summary /path/to/mqtl/chr${CHR} \
+      --out           ${RES_DIR}/${CHR_PHENO}_${SMOKE_STATUS}_mqtl \
+      --thread-num    12 \
+      --peqtl-smr     5e-8 \
+      --heidi-min-m   10
+  done
+done
+
+echo "SMR & HEIDI analysis completed"
+```
+
+------------------------------------------------------------------------
+
+# Step 7: Gene-Smoking Interaction on Biomarker-Related Diseases
+
+## 7.1 Identify Biomarker-Related Diseases
+
+Cox proportional hazards regression is used to identify diseases
+significantly associated with each biomarker. The Bonferroni-corrected
+significance threshold is:
+
+$$P < 0.05/7/378$$
+
+```{r biomarker-disease}
+library(survival)
+library(data.table)
+library(dplyr)
+
+# ------ Load and standardise biomarker data ------
+biomarker <- fread("biomarker_file.csv") %>%
+  select(IID, alt, dbil, crp, hba1c, ggt, tbil, urate) %>%
+  mutate(across(c(alt, dbil, crp, hba1c, ggt, tbil, urate), scale))
+
+disease_files   <- list.files("path/to/diseases", full.names = TRUE)
+all_cox_results <- list()
+
+for (disease_file in disease_files) {
+  disease_id   <- basename(disease_file) %>% gsub("\\.txt", "", .)
+  disease_data <- fread(disease_file)
+
+  for (bm in c("alt", "dbil", "crp", "hba1c", "ggt", "tbil", "urate")) {
+    data <- disease_data %>%
+      inner_join(biomarker, by = "IID") %>%
+      filter(!is.na(.data[[bm]]))
+
+    # Cox proportional hazards model with full covariate adjustment
+    cox_formula <- as.formula(paste(
+      "Surv(time, disease) ~", bm, "+",
+      paste(c(
+        paste0("PC", 1:40), "age", "sex", "bmi", "drink",
+        "tdi", "agesex", "age2", "age2sex", "ever_smoke"
+      ), collapse = " + ")
+    ))
+
+    cox_model <- coxph(cox_formula, data = data)
+    result    <- summary(cox_model)$coefficients[bm, ]
+
+    all_cox_results[[paste(disease_id, bm)]] <- data.frame(
+      Disease   = disease_id,
+      Biomarker = bm,
+      P         = result["Pr(>|z|)"]
+    )
+  }
+}
+
+# ------ Apply Bonferroni correction: P < 0.05 / (7 biomarkers x 378 diseases) ------
+biomarker_diseases <- bind_rows(all_cox_results) %>%
+  filter(P < 0.05 / 7 / 378)
+
+fwrite(biomarker_diseases, "biomarker_related_diseases.txt", sep = "\t")
+```
+
+## 7.2 SPAGxECCT: SNP×Smoking Interaction on Diseases
+
+```{r spagxecct}
+library(SPAGxECCT)
+
+# ------ Define SNP-to-biomarker mapping ------
+snp_biomarker_map <- data.frame(
+  SNP = c(
+    "rs57274629_G",        "rs141119227_G",       "2:234594895_AT_A_A",
+    "rs143373661_G",       "rs11675168_A",         "rs887829_T",
+    "rs4148324_G",         "rs10199512_A",         "4:9960841_TA_T_T",
+    "rs146009840_T",       "rs7170068_A",          "rs5760495_T",
+    "rs3747207_A"
+  ),
+  Biomarker = c(
+    "crp",  "crp",  "crp",  "crp",  "crp",  "crp",
+    "tbil", "tbil", "alt",  "alt",  "urate","dbil",
+    "hba1c"
+  )
+)
+
+all_gxe_results <- list()
+
+# ------ Run GxE interaction test for each disease-biomarker pair ------
+for (i in 1:nrow(biomarker_diseases)) {
+  disease_id  <- biomarker_diseases$Disease[i]
+  bm          <- biomarker_diseases$Biomarker[i]
+
+  # Retrieve SNPs associated with this biomarker
+  snps_for_bm <- snp_biomarker_map %>%
+    filter(Biomarker == bm) %>%
+    pull(SNP)
+
+  if (length(snps_for_bm) == 0) next
+
+  # Load disease data and merge with genotype data
+  disease_data <- fread(paste0("path/to/diseases/", disease_id, ".txt")) %>%
+    inner_join(all_snp_code, by = c("FID", "IID"))
+
+  for (snp in snps_for_bm) {
+    data <- disease_data %>%
+      select(
+        IID, all_of(disease_id), time,
+        starts_with("PC"), age, sex, bmi, drink,
+        tdi, agesex, age2, age2sex, ever_smoke, all_of(snp)
+      ) %>%
+      filter(complete.cases(.))
+
+    # Skip if sample size is too small for reliable inference
+    if (nrow(data) < 100) next
+
+    # ------ Prepare phenotype matrix ------
+    Phen.mtx <- data %>%
+      mutate(
+        ID        = IID,
+        event     = as.integer(.data[[disease_id]]),
+        surv.time = as.numeric(time)
+      ) %>%
+      as.data.frame()
+
+    # Environmental variable: smoking status (binary)
+    E <- as.numeric(Phen.mtx$ever_smoke)
+
+    # Genotype matrix: one column per SNP
+    Geno.mtx <- matrix(
+      as.integer(data[[snp]]),
+      ncol     = 1,
+      dimnames = list(data$IID, snp)
+    )
+
+    # ------ Define null model formula with full covariate adjustment ------
+    cov_formula <- as.formula(paste(
+      "Surv(surv.time, event) ~",
+      paste(c(
+        paste0("PC", 1:40), "age", "sex", "bmi", "drink",
+        "tdi", "agesex", "age2", "age2sex", "ever_smoke"
+      ), collapse = " + ")
+    ))
+
+    # Step 1: Fit null model and compute martingale residuals
+    R <- SPA_G_Get_Resid(
+      traits      = "survival",
+      formula.obj = cov_formula,
+      data        = Phen.mtx,
+      pIDs        = Phen.mtx$ID,
+      gIDs        = rownames(Geno.mtx)
+    )
+
+    # Step 2: Gene-environment interaction test via SPAGxE-CCT
+    res <- SPAGxE_CCT(
+      traits   = "survival",
+      Geno.mtx = Geno.mtx,
+      R        = R,
+      E        = E,
+      Phen.mtx = Phen.mtx,
+      Cova.mtx = select(
+        Phen.mtx,
+        starts_with("PC"), age, sex, bmi, drink,
+        tdi, agesex, age2, age2sex
+      )
+    )
+
+    all_gxe_results[[paste(disease_id, snp)]] <- cbind(
+      Disease   = disease_id,
+      Biomarker = bm,
+      SNP       = snp,
+      as.data.frame(res)
+    )
+  }
+}
+
+# ------ Combine and save all GxE interaction results ------
+final <- bind_rows(all_gxe_results)
+fwrite(final, "Biomarker_related_GxE_results.txt", sep = "\t")
+```
+
+------------------------------------------------------------------------
+
+# Step 8: Moderated Mediation Analysis
+
+The moderated mediation framework is defined as follows:
+
+-   **X** (smoking status) → **M** (biomarker measured at baseline) →
+    **Y** (disease onset after baseline)
+-   **Moderator (W)**: SNP genotype (0 / 1 / 2)
+-   Confidence intervals are estimated via bootstrap resampling (1,000
+    iterations)
+
+```{r mediation}
+library(bruceR)
+library(data.table)
+
+analyze_moderated_mediation <- function(data, bm_resid, SNP, PHE) {
+
+  setDT(data)
+
+  # ------ Classify disease status based on temporal order relative to baseline ------
+  data[, disease_category := fcase(
+    disease_status == 0,                                 "no_disease",
+    disease_status == 1 & disease_date < baseline_date,  "before_baseline",
+    disease_status == 1 & disease_date >= baseline_date, "after_baseline"
+  )]
+
+  # ------ Retain only individuals with the correct temporal order ------
+  # Biomarker measured at baseline must precede disease onset
+  data <- data[disease_category %in% c("no_disease", "after_baseline")]
+
+  # Create binary event indicator for disease onset after baseline
+  data[, event := fifelse(disease_category == "after_baseline", 1, 0)]
+
+  # Define covariates for model adjustment
+  cov_vars <- c(
+    paste0("PC", 1:40),
+    "age", "sex", "bmi", "drink", "tdi",
+    "agesex", "age2", "age2sex"
+  )
+
+  # ------ Fit moderated mediation model using PROCESS macro ------
+  # X  (ever_smoke)  → M (biomarker at baseline) → Y (disease after baseline)
+  # Moderation by W (SNP genotype) applied to all paths
+  p1 <- PROCESS(
+    data,
+    y        = "event",          # Outcome: disease onset after baseline
+    x        = "ever_smoke",     # Exposure: binary smoking status
+    meds     = bm_resid,         # Mediator: baseline biomarker residuals
+    mods     = "snp_val",        # Moderator: SNP genotype (0, 1, 2)
+    mod.path = "all",            # Moderation applied to all paths (a, b, c')
+    mod1.val = c(0, 1, 2),       # Genotype values at which to evaluate moderation
+    covs     = cov_vars,         # Covariates included in the model
+    cov.path = "y",              # Covariates enter only the outcome equation
+    ci       = "boot",           # Bootstrap confidence intervals
+    nsim     = 1000,             # Number of bootstrap iterations
+    seed     = 2025              # Random seed for reproducibility
+  )
+
+  # Save results as an RDS file for subsequent reporting
+  saveRDS(p1, paste0("results/", bm_resid, "_", PHE, "_", SNP, ".rds"))
+
+  return(p1)
+}
+
+# ------ Example usage ------
+# data   <- fread("path/to/mediation_data.csv")
+# result <- analyze_moderated_mediation(
+#   data     = data,
+#   bm_resid = "crp_resid",
+#   SNP      = "rs57274629_G",
+#   PHE      = "X480"
+# )
+```
+
+------------------------------------------------------------------------
+
+```{r session-info}
+R version 4.3.3 (2024-02-29 ucrt)
+Platform: x86_64-w64-mingw32/x64 (64-bit)
+Running under: Windows 10 x64 (build 19045)
+```
